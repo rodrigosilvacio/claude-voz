@@ -18,7 +18,7 @@ comment on table public.nina_config is
 
 insert into public.nina_config (chave, valor) values
   ('webhook_secret', encode(extensions.gen_random_bytes(32), 'hex')),
-  ('elevenlabs_voice_id', 'NS7yU4WmAouJsg84X3Mg'),
+  ('elevenlabs_voice_id', 'oJebhZNaPllxk6W0LSBA'),
   ('elevenlabs_model', 'eleven_multilingual_v2'),
   ('openai_tts_voice', 'marin'),
   ('modelo_conversa', 'claude-opus-5-5'),
