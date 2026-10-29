@@ -1,6 +1,6 @@
 # System prompt: Nina
 
-> Versão 0.1. Este texto vai no campo `system` da chamada ao Claude. As seções entre `{{ }}` são preenchidas pelo código a cada mensagem.
+> Versão 0.1, para leitura. O texto que roda de fato está em `supabase/functions/nina-telegram/prompt.ts` (parte fixa em cache + contexto dinâmico enviado como mensagem de sistema). As seções entre `{{ }}` são preenchidas pelo código a cada mensagem.
 
 ---
 
