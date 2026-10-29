@@ -13,6 +13,34 @@ export interface Resposta {
   uso: unknown;
 }
 
+// Camada 2 do histórico: a Nina pesquisa conversas antigas quando o Rodrigo
+// pede para lembrar de algo ou quando ela precisa de um detalhe que não está
+// no contexto.
+const FERRAMENTA_HISTORICO = {
+  name: "pesquisar_historico",
+  description:
+    "Pesquisa o histórico completo de conversas com o Rodrigo. Use quando ele pedir para lembrar de algo " +
+    "dito antes (\"o que eu te falei sobre...\", \"o que você me aconselhou...\", \"semana passada...\") ou " +
+    "quando você precisar de um detalhe de conversa antiga que não está no contexto. Combine os filtros: " +
+    "consulta para buscar por assunto, de e ate para um período, termo_exato para um nome ou palavra específica.",
+  input_schema: {
+    type: "object" as const,
+    additionalProperties: false,
+    properties: {
+      consulta: { type: "string", description: "Assunto a buscar, em linguagem natural." },
+      de: { type: "string", description: "Data inicial AAAA-MM-DD, inclusiva, no fuso de São Paulo." },
+      ate: { type: "string", description: "Data final AAAA-MM-DD, inclusiva, no fuso de São Paulo." },
+      termo_exato: { type: "string", description: "Nome ou palavra que precisa aparecer no texto." },
+    },
+    required: [],
+  },
+};
+
+// Quantas pesquisas a Nina pode encadear antes de ter que responder.
+const MAX_PESQUISAS = 3;
+
+export type Pesquisar = (filtros: Record<string, string>) => Promise<string>;
+
 // Effort baixo segura a latência da conversa por voz; dá para subir pela
 // nina_config (esforco_conversa) sem novo deploy.
 export async function responder(
@@ -20,38 +48,84 @@ export async function responder(
   contexto: string,
   modelo: string,
   esforco: "low" | "medium" | "high",
+  pesquisar: Pesquisar,
 ): Promise<Resposta> {
-  const resposta = await anthropic().beta.messages.create({
-    model: modelo,
-    max_tokens: 8000,
-    // Se um classificador de segurança recusar (falso positivo em tema pessoal
-    // pesado), a própria API refaz no modelo de reserva recomendado.
-    betas: ["server-side-fallback-2026-07-01"],
-    fallbacks: "default",
-    output_config: { effort: esforco },
-    // Prompt fixo em cache; histórico só cresce no fim, então o prefixo também
-    // é reaproveitado entre mensagens.
-    cache_control: { type: "ephemeral" },
-    system: NINA_SYSTEM,
-    messages: [
-      ...historico,
-      // Contexto da memória como mensagem de sistema depois da última fala do
-      // Rodrigo: não quebra o cache do histórico e tem autoridade de operador.
-      { role: "system", content: contexto },
-    ],
-  });
+  // Contexto da memória como mensagem de sistema depois da última fala do
+  // Rodrigo: não quebra o cache do histórico e tem autoridade de operador.
+  const mensagens: Anthropic.Beta.BetaMessageParam[] = [...historico, { role: "system", content: contexto }];
+  const usos: unknown[] = [];
+  let pesquisas = 0;
 
-  if (resposta.stop_reason === "refusal") {
-    return {
-      texto: "Não consigo responder isso desse jeito. Me conta de outro ângulo o que está acontecendo.",
-      uso: resposta.usage,
-    };
+  // Uma rodada a mais que o limite: depois do aviso de limite, a Nina responde.
+  for (let rodada = 0; rodada <= MAX_PESQUISAS + 1; rodada++) {
+    const resposta = await anthropic().beta.messages.create({
+      model: modelo,
+      max_tokens: 8000,
+      // Se um classificador de segurança recusar (falso positivo em tema pessoal
+      // pesado), a própria API refaz no modelo de reserva recomendado.
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",
+      output_config: { effort: esforco },
+      // Prompt fixo em cache; histórico só cresce no fim, então o prefixo também
+      // é reaproveitado entre mensagens.
+      cache_control: { type: "ephemeral" },
+      system: NINA_SYSTEM,
+      // A ferramenta fica sempre declarada: o histórico do turno já tem blocos
+      // de tool_use, e trocar a lista quebraria o cache.
+      tools: [FERRAMENTA_HISTORICO],
+      messages: mensagens,
+    });
+    usos.push(resposta.usage);
+
+    if (resposta.stop_reason === "refusal") {
+      return {
+        texto: "Não consigo responder isso desse jeito. Me conta de outro ângulo o que está acontecendo.",
+        uso: usos,
+      };
+    }
+
+    const chamadas = resposta.content.filter((b) => b.type === "tool_use");
+    if (resposta.stop_reason !== "tool_use" || !chamadas.length) {
+      const texto = resposta.content
+        .flatMap((b) => (b.type === "text" ? [b.text] : []))
+        .join("")
+        .trim();
+      return { texto: texto || "Travei aqui. Fala de novo?", uso: usos };
+    }
+
+    // Conteúdo devolvido sem alteração, inclusive os blocos de raciocínio.
+    mensagens.push({ role: "assistant", content: resposta.content });
+    const resultados: Anthropic.Beta.BetaToolResultBlockParam[] = [];
+    for (const chamada of chamadas) {
+      if (chamada.type !== "tool_use") continue;
+      pesquisas++;
+      if (pesquisas > MAX_PESQUISAS) {
+        resultados.push({
+          type: "tool_result",
+          tool_use_id: chamada.id,
+          content: "Limite de pesquisas desta resposta atingido. Responda agora com o que você já tem.",
+          is_error: true,
+        });
+        continue;
+      }
+      try {
+        resultados.push({
+          type: "tool_result",
+          tool_use_id: chamada.id,
+          content: await pesquisar(chamada.input as Record<string, string>),
+        });
+      } catch (e) {
+        resultados.push({
+          type: "tool_result",
+          tool_use_id: chamada.id,
+          content: `A pesquisa falhou: ${e instanceof Error ? e.message : String(e)}`,
+          is_error: true,
+        });
+      }
+    }
+    mensagens.push({ role: "user", content: resultados });
   }
-  const texto = resposta.content
-    .flatMap((b) => (b.type === "text" ? [b.text] : []))
-    .join("")
-    .trim();
-  return { texto: texto || "Travei aqui. Fala de novo?", uso: resposta.usage };
+  return { texto: "Me perdi procurando no nosso histórico. Pergunta de novo de um jeito mais direto?", uso: usos };
 }
 
 export interface Extracao {

@@ -40,21 +40,123 @@ export async function salvarMensagem(
   return data.id;
 }
 
-export async function historico(): Promise<Turno[]> {
+// Últimas mensagens, e o id da mais antiga delas: trechos anteriores a ele
+// só entram no contexto pela busca no histórico.
+export async function historico(): Promise<{ turnos: Turno[]; menorId: number }> {
   const { data, error } = await supabase
     .from("nina_mensagens")
-    .select("papel, conteudo")
+    .select("id, papel, conteudo")
     .neq("origem", "comando")
     .order("id", { ascending: false })
     .limit(HISTORICO_LIMITE);
   if (error) throw error;
-  const turnos = (data ?? []).reverse().map((m: { papel: "user" | "assistant"; conteudo: string }) => ({
-    role: m.papel,
-    content: m.conteudo,
-  }));
+  const linhas = (data ?? []).reverse() as { id: number; papel: "user" | "assistant"; conteudo: string }[];
   // A API exige começar por uma fala do usuário.
-  while (turnos.length && turnos[0].role !== "user") turnos.shift();
-  return turnos;
+  while (linhas.length && linhas[0].papel !== "user") linhas.shift();
+  return {
+    turnos: linhas.map((m) => ({ role: m.papel, content: m.conteudo })),
+    menorId: linhas[0]?.id ?? Number.MAX_SAFE_INTEGER,
+  };
+}
+
+export interface Trecho {
+  texto: string;
+  criado_em: string;
+}
+
+const dataSP = (iso: string) =>
+  new Date(iso).toLocaleDateString("pt-BR", { timeZone: "America/Sao_Paulo", dateStyle: "long" });
+
+export function formatarTrecho(t: Trecho): string {
+  return `Conversa de ${dataSP(t.criado_em)}:\n${t.texto}`;
+}
+
+// Camada 1: trechos antigos parecidos com a mensagem atual.
+export async function trechosRelevantes(vetor: number[] | null, antesDe: number): Promise<Trecho[]> {
+  if (!vetor) return [];
+  const { data, error } = await supabase.rpc("nina_buscar_trocas", {
+    p_embedding: JSON.stringify(vetor),
+    p_antes_de_mensagem: antesDe,
+    p_limite: 4,
+  });
+  if (error) throw error;
+  // Corte mais alto que o das memórias: um trecho inteiro fora de assunto
+  // atrapalha mais que uma frase solta.
+  return (data ?? []).filter((t: { similaridade: number }) => t.similaridade > 0.35);
+}
+
+// Camada 2: pesquisa pedida pela Nina via ferramenta.
+export async function pesquisarHistorico(
+  filtros: { consulta?: string; de?: string; ate?: string; termo_exato?: string },
+): Promise<string> {
+  const vetor = filtros.consulta ? await embedding(filtros.consulta) : null;
+  // Datas chegam como AAAA-MM-DD no fuso de São Paulo; "ate" é inclusivo.
+  const inicio = (d?: string) => (d ? `${d}T00:00:00-03:00` : null);
+  const fimInclusivo = (d?: string) => {
+    if (!d) return null;
+    const dia = new Date(`${d}T00:00:00-03:00`);
+    dia.setUTCDate(dia.getUTCDate() + 1);
+    return dia.toISOString();
+  };
+  const { data, error } = await supabase.rpc("nina_pesquisar_historico", {
+    p_embedding: vetor ? JSON.stringify(vetor) : null,
+    p_de: inicio(filtros.de),
+    p_ate: fimInclusivo(filtros.ate),
+    p_termo: filtros.termo_exato?.trim() || null,
+    p_limite: 8,
+  });
+  if (error) throw error;
+  if (!data?.length) return "Nada encontrado no histórico com esses filtros.";
+  return (data as Trecho[]).map(formatarTrecho).join("\n\n---\n\n");
+}
+
+const textoTroca = (fala: string, resposta: string) => `Rodrigo: ${fala}\nNina: ${resposta}`;
+
+export async function indexarTroca(
+  mensagemUserId: number,
+  mensagemNinaId: number,
+  fala: string,
+  resposta: string,
+  criadoEm: string,
+): Promise<void> {
+  const texto = textoTroca(fala, resposta);
+  let vetor: number[] | null = null;
+  try {
+    vetor = await embedding(texto);
+  } catch (e) {
+    console.error("troca salva sem embedding:", e);
+  }
+  const { error } = await supabase.from("nina_trocas").upsert({
+    mensagem_user_id: mensagemUserId,
+    mensagem_nina_id: mensagemNinaId,
+    texto,
+    embedding: vetor ? JSON.stringify(vetor) : null,
+    criado_em: criadoEm,
+  }, { onConflict: "mensagem_user_id" });
+  if (error) console.error("erro ao indexar troca:", error);
+}
+
+// Indexa o que foi conversado antes do histórico pesquisável existir.
+export async function indexarPendentes(): Promise<number> {
+  let total = 0;
+  // Limite de rodadas: se uma troca falhar sempre, ela volta como pendente e
+  // o laço não pode girar para sempre.
+  for (let rodada = 0; rodada < 40; rodada++) {
+    const { data, error } = await supabase.rpc("nina_trocas_pendentes", { p_limite: 50 });
+    if (error) throw error;
+    if (!data?.length) return total;
+    for (const p of data as {
+      mensagem_user_id: number;
+      mensagem_nina_id: number;
+      fala: string;
+      resposta: string;
+      criado_em: string;
+    }[]) {
+      await indexarTroca(p.mensagem_user_id, p.mensagem_nina_id, p.fala, p.resposta, p.criado_em);
+      total++;
+    }
+  }
+  return total;
 }
 
 export async function memoriasAtivas(tipos: string[], limite = 30): Promise<Memoria[]> {

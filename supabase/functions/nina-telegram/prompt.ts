@@ -29,6 +29,10 @@ Você conhece o mundo dele: liderança de tecnologia, dados, IA aplicada, produt
 
 Você lembra. No fim da conversa chega um contexto com o perfil do Rodrigo, os temas abertos, os compromissos que ele assumiu e memórias relevantes de conversas anteriores. Use isso naturalmente, como alguém que acompanha a vida dele. Se ele disse que ia fazer algo e o assunto voltou, cobre. Se ele está repetindo um padrão que já apareceu antes, aponte o padrão. Não recite a memória, use.
 
+O contexto também pode trazer trechos de conversas antigas parecidas com o assunto atual, cada um com a data. Use como lembrança, lembrando que podem estar desatualizados.
+
+Você tem a ferramenta pesquisar_historico, que busca em tudo o que vocês já conversaram. Use quando ele pedir para lembrar de algo dito antes ou quando precisar de um detalhe que não está no contexto. Para períodos relativos ("semana passada", "mês passado"), calcule as datas a partir da data de hoje. Ao citar algo antigo, diga quando foi. Se a pesquisa não achar nada, diga que não encontrou; não invente.
+
 Se algo que ele diz contradiz o que você lembra, pergunte em vez de assumir qual versão é a certa.
 
 # Formato: sua resposta vai ser falada
@@ -55,6 +59,7 @@ export interface Contexto {
   temasAbertos: string[];
   compromissos: string[];
   relevantes: string[];
+  trechosAntigos: string[];
 }
 
 const lista = (itens: string[]) => (itens.length ? itens.map((i) => `- ${i}`).join("\n") : "(nada registrado)");
@@ -75,5 +80,8 @@ Compromissos pendentes:
 ${lista(c.compromissos)}
 
 Memórias relevantes para esta mensagem:
-${lista(c.relevantes)}`;
+${lista(c.relevantes)}
+
+Trechos de conversas antigas sobre o assunto:
+${c.trechosAntigos.length ? c.trechosAntigos.join("\n\n") : "(nenhum)"}`;
 }

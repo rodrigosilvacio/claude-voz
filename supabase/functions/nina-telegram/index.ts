@@ -8,7 +8,8 @@
 //      relevantes (pgvector) e as últimas mensagens.
 //   4. Claude gera a resposta da Nina; ElevenLabs fala (OpenAI de reserva).
 //   5. Envia áudio(s) + texto com botões de feedback.
-//   6. Um modelo menor extrai memórias da troca e grava.
+//   6. Um modelo menor extrai memórias da troca e grava; a troca inteira
+//      ganha embedding para ser achada depois no histórico.
 //
 // Só o Telegram user ID guardado em nina_config.telegram_user_id é atendido.
 // Enquanto ele não está configurado, o bot só informa o ID de quem escreveu.
@@ -23,10 +24,15 @@ import {
   aplicarExtracao,
   embedding,
   formatar,
+  formatarTrecho,
   historico,
+  indexarPendentes,
+  indexarTroca,
   memoriasAtivas,
   memoriasRelevantes,
+  pesquisarHistorico,
   salvarMensagem,
+  trechosRelevantes,
 } from "./memoria.ts";
 import { contextoDinamico } from "./prompt.ts";
 
@@ -59,6 +65,14 @@ Deno.serve(async (req) => {
     }
     const resultado = await tg.configurarWebhook(`${SUPABASE_URL}/functions/v1/nina-telegram`, cfg.webhook_secret);
     return Response.json({ ok: true, resultado });
+  }
+
+  // Indexa no histórico pesquisável as trocas que ainda não têm embedding.
+  if (url.searchParams.get("acao") === "indexar") {
+    if (!iguais(req.headers.get("x-nina-setup") ?? "", cfg.webhook_secret)) {
+      return new Response("não autorizado", { status: 401 });
+    }
+    return Response.json({ ok: true, indexadas: await indexarPendentes() });
   }
 
   if (!iguais(req.headers.get("x-telegram-bot-api-secret-token") ?? "", cfg.webhook_secret)) {
@@ -133,12 +147,14 @@ async function tratarUpdate(update: any) {
     // Contexto da memória. Se o embedding falhar, segue sem busca semântica.
     const t1 = Date.now();
     const vetor = await embedding(fala).catch((e) => (console.error("embedding da fala falhou:", e), null));
-    const [abertas, relevantes, fatos, turnos] = await Promise.all([
+    const [abertas, relevantes, fatos, { turnos, menorId }] = await Promise.all([
       memoriasAtivas(["compromisso", "tema_aberto"]),
       memoriasRelevantes(vetor),
       memoriasAtivas(["fato", "pessoa"], 25),
       historico(),
     ]);
+    const trechos = await trechosRelevantes(vetor, menorId)
+      .catch((e) => (console.error("busca no histórico falhou:", e), []));
     const idsAbertas = new Set(abertas.map((m) => m.id));
     const contexto = contextoDinamico({
       agora: agoraSP(),
@@ -147,6 +163,7 @@ async function tratarUpdate(update: any) {
       temasAbertos: abertas.filter((m) => m.tipo === "tema_aberto").map(formatar),
       compromissos: abertas.filter((m) => m.tipo === "compromisso").map(formatar),
       relevantes: relevantes.filter((m) => !idsAbertas.has(m.id)).map(formatar),
+      trechosAntigos: trechos.map(formatarTrecho),
     });
     latencias.contexto_ms = Date.now() - t1;
 
@@ -155,7 +172,13 @@ async function tratarUpdate(update: any) {
       | "low"
       | "medium"
       | "high";
-    const resposta = await responder(turnos, contexto, cfg.modelo_conversa ?? "claude-opus-5-5", esforco);
+    const resposta = await responder(
+      turnos,
+      contexto,
+      cfg.modelo_conversa ?? "claude-opus-5-5",
+      esforco,
+      pesquisarHistorico,
+    );
     latencias.llm_ms = Date.now() - t2;
 
     const t3 = Date.now();
@@ -190,7 +213,10 @@ async function tratarUpdate(update: any) {
     ]]);
     pararAcao();
 
-    await atualizarMemoria(fala, resposta.texto, mensagemId, [...abertas, ...relevantes]);
+    await Promise.all([
+      atualizarMemoria(fala, resposta.texto, mensagemId, [...abertas, ...relevantes]),
+      indexarTroca(mensagemId, respostaId, fala, resposta.texto, new Date().toISOString()),
+    ]);
   } catch (e) {
     console.error("falha ao responder:", e);
     await tg.enviarTexto(chatId, "Deu problema do meu lado e não consegui responder. Tenta de novo em um minuto.")
